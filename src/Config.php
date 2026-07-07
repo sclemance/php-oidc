@@ -27,6 +27,9 @@ final class Config
     public readonly int $leeway;
     public readonly int $cacheTtl;
     public readonly int $httpTimeout;
+    public readonly bool $storeTokens;
+    public readonly int $idleTtl;      // seconds; 0 = disabled
+    public readonly int $absoluteTtl;  // seconds; 0 = disabled
     public readonly ?string $postLogoutRedirectUri;
     public readonly string $sessionNamespace;
     /** @var array<string,string> extra params added to the authorization request */
@@ -73,6 +76,11 @@ final class Config
         $this->leeway = (int) ($c['leeway'] ?? 60);
         $this->cacheTtl = (int) ($c['cache_ttl'] ?? 3600);
         $this->httpTimeout = (int) ($c['http_timeout'] ?? 15);
+
+        // Opt-in session hardening. All default to "off" so the simple case is unchanged.
+        $this->storeTokens = (bool) ($c['store_tokens'] ?? true);
+        $this->idleTtl = max(0, (int) ($c['session_idle_ttl'] ?? 0));
+        $this->absoluteTtl = max(0, (int) ($c['session_absolute_ttl'] ?? 0));
         $this->postLogoutRedirectUri = isset($c['post_logout_redirect_uri'])
             ? (string) $c['post_logout_redirect_uri'] : null;
         $this->sessionNamespace = (string) ($c['session_namespace'] ?? 'oidc');

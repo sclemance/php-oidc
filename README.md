@@ -103,6 +103,47 @@ catch (Sclemance\Oidc\Exception\AuthenticationException $e) {
     // or: in_array('<group-object-id>', $claims['groups'] ?? [], true),
 ```
 
+## Simple by default, extensible when you need it
+
+The one-liner covers most apps, but nothing is hidden from you.
+
+**Render your own failure page.** `requireAuth()` throws `AuthenticationException` for a bad
+`state`, a provider error, or a rejected `authorize` policy — catch it and show whatever you
+want:
+```php
+use Sclemance\Oidc\Exception\AuthenticationException;
+
+try {
+    $user = $oidc->requireAuth();
+} catch (AuthenticationException $e) {
+    http_response_code(403);
+    // $e->oauthError holds the provider's error code (e.g. 'access_denied') when present.
+    require __DIR__ . '/views/access-denied.php';
+    exit;
+}
+```
+
+**Control the redirects yourself** (no `header()`/`exit` from the library) using the
+primitives — handy inside a framework or when you want an interstitial:
+```php
+$url  = $oidc->getAuthorizationUrl($returnTo);   // build URL + stash transaction; you redirect
+$user = $oidc->handleCallback();                 // exchange + validate at your callback route
+$user = $oidc->user();                           // current user or null (no redirect)
+$url  = $oidc->getLogoutUrl($returnTo, $idHint); // provider end-session URL (or null); you redirect
+$oidc->forgetUser();                             // clear the local session only
+```
+
+**Harden the session** for sensitive apps (all opt-in):
+```php
+'store_tokens'         => false,   // don't persist tokens if you don't need them post-login
+'session_idle_ttl'     => 1800,    // re-auth after 30 min idle
+'session_absolute_ttl' => 28800,   // re-auth 8 h after login regardless of activity
+```
+
+> **Note (by design):** auth is session-based — there's no back-channel logout or live
+> revocation check, so a local session stays valid until it (or a timeout) expires. Pair a
+> timeout with your provider's Conditional Access for tighter control.
+
 ## Configuration reference
 
 | Key | Required | Default | Description |
@@ -116,6 +157,9 @@ catch (Sclemance\Oidc\Exception\AuthenticationException $e) {
 | `pkce` | no | `true` | Use PKCE S256. |
 | `verify_signature` | no | `true` | Verify the ID-token signature against JWKS. |
 | `leeway` | no | `60` | Clock-skew tolerance (seconds) for time-based claims. |
+| `store_tokens` | no | `true` | Persist the access/refresh/ID tokens in the session. Set `false` to keep only claims (smaller attack surface); tokens are still returned by `handleCallback()`/`requireAuth()` for use during that request. |
+| `session_idle_ttl` | no | `0` (off) | Re-authenticate after this many seconds of inactivity. |
+| `session_absolute_ttl` | no | `0` (off) | Re-authenticate this many seconds after login, regardless of activity. |
 | `authorize` | no | — | `callable(array $claims): bool` — return false to deny. |
 | `auth_params` | no | `[]` | Extra authorization-request params (e.g. `['domain_hint'=>'acme.com']`). |
 | `post_logout_redirect_uri` | no | — | Where the provider returns after single-logout. |

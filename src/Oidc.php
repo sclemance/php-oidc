@@ -30,6 +30,7 @@ final class Oidc
 {
     private const S_USER = 'user';
     private const S_TX   = 'tx';
+    private const S_META = 'meta';
 
     private Config $config;
     private Http $http;
@@ -59,7 +60,22 @@ final class Oidc
      * - Arriving on a callback -> completes login and redirects to the originating URL (exits).
      * - Otherwise              -> redirects to the provider to authenticate (exits).
      *
+     * Simple by default; extensible when you want it. To render your OWN failure page (bad
+     * state, provider error, denied by your authorize policy), wrap the call:
+     *
+     *     try { $user = $oidc->requireAuth(); }
+     *     catch (Sclemance\Oidc\Exception\AuthenticationException $e) {
+     *         // $e->oauthError carries the provider's error code when present.
+     *         http_response_code(403);
+     *         require 'my-access-denied.php';
+     *         exit;
+     *     }
+     *
+     * For full control over the redirects themselves (no header()/exit from the library), use
+     * the primitives instead: getAuthorizationUrl(), handleCallback(), user(), getLogoutUrl().
+     *
      * @param array<string,string> $extraAuthParams e.g. ['prompt' => 'none'] for a silent check
+     * @throws AuthenticationException on a failed/denied callback
      */
     public function requireAuth(array $extraAuthParams = []): UserInfo
     {
@@ -77,24 +93,56 @@ final class Oidc
         $this->login(null, $extraAuthParams); // redirects and exits
     }
 
-    /** Non-redirecting check. Returns the current user or null. */
+    /**
+     * Non-redirecting check. Returns the current user or null.
+     *
+     * Enforces the optional idle/absolute session timeouts: an expired session is cleared and
+     * null is returned (so requireAuth() will transparently re-authenticate).
+     */
     public function user(): ?UserInfo
     {
         $data = $this->config->session->get(self::S_USER);
-        return is_array($data) ? UserInfo::fromSession($data) : null;
+        if (!is_array($data)) {
+            return null;
+        }
+
+        $now = time();
+        $meta = $this->config->session->get(self::S_META);
+        $meta = is_array($meta) ? $meta : [];
+
+        if ($this->config->absoluteTtl > 0
+            && isset($meta['auth_time'])
+            && $now - (int) $meta['auth_time'] > $this->config->absoluteTtl) {
+            $this->forgetUser();
+            return null;
+        }
+        if ($this->config->idleTtl > 0
+            && isset($meta['last_seen'])
+            && $now - (int) $meta['last_seen'] > $this->config->idleTtl) {
+            $this->forgetUser();
+            return null;
+        }
+        if ($this->config->idleTtl > 0) {
+            $meta['last_seen'] = $now;
+            $this->config->session->set(self::S_META, $meta);
+        }
+
+        return UserInfo::fromSession($data);
     }
 
     public function isAuthenticated(): bool
     {
-        return $this->config->session->get(self::S_USER) !== null;
+        return $this->user() !== null;
     }
 
     /**
-     * Begin authentication explicitly (e.g. from a "Sign in" button). Redirects and exits.
+     * Build the authorization-request URL and persist the login transaction — WITHOUT
+     * redirecting. Use this if you want to control the redirect yourself (e.g. return a
+     * framework redirect response, or show an interstitial). Otherwise use login().
      *
      * @param array<string,string> $extraAuthParams
      */
-    public function login(?string $returnTo = null, array $extraAuthParams = []): never
+    public function getAuthorizationUrl(?string $returnTo = null, array $extraAuthParams = []): string
     {
         $returnTo ??= $this->currentUrl();
 
@@ -125,7 +173,17 @@ final class Oidc
         $params += $this->config->authParams;
         $params = array_merge($params, $extraAuthParams);
 
-        $this->redirect($this->discovery->authorizationEndpoint() . '?' . http_build_query($params));
+        return $this->discovery->authorizationEndpoint() . '?' . http_build_query($params);
+    }
+
+    /**
+     * Begin authentication explicitly (e.g. from a "Sign in" button). Redirects and exits.
+     *
+     * @param array<string,string> $extraAuthParams
+     */
+    public function login(?string $returnTo = null, array $extraAuthParams = []): never
+    {
+        $this->redirect($this->getAuthorizationUrl($returnTo, $extraAuthParams));
     }
 
     /**
@@ -174,10 +232,49 @@ final class Oidc
 
         // New authenticated session: rotate the id, then store.
         $this->config->session->regenerate();
-        $this->config->session->set(self::S_USER, $user->toSession());
+        $sessionData = $user->toSession();
+        if (!$this->config->storeTokens) {
+            // Keep claims but do not persist tokens (they remain available on the returned
+            // UserInfo for use during THIS request).
+            $sessionData['tokens'] = [];
+        }
+        $this->config->session->set(self::S_USER, $sessionData);
+        $now = time();
+        $this->config->session->set(self::S_META, ['auth_time' => $now, 'last_seen' => $now]);
         $this->config->session->remove(self::S_TX);
 
         return $user;
+    }
+
+    /** Clear the local session only (no redirect). */
+    public function forgetUser(): void
+    {
+        $this->config->session->remove(self::S_USER);
+        $this->config->session->remove(self::S_META);
+        $this->config->session->remove(self::S_TX);
+        $this->config->session->regenerate();
+    }
+
+    /**
+     * Build the provider's RP-initiated logout (end-session) URL, or null if the provider
+     * doesn't advertise one. Does NOT clear the session or redirect — call forgetUser()
+     * yourself if you use this primitive.
+     */
+    public function getLogoutUrl(?string $returnTo = null, ?string $idTokenHint = null): ?string
+    {
+        $endpoint = $this->discovery->endSessionEndpoint();
+        if ($endpoint === null) {
+            return null;
+        }
+        $params = [];
+        if ($idTokenHint !== null) {
+            $params['id_token_hint'] = $idTokenHint;
+        }
+        $post = $returnTo ?? $this->config->postLogoutRedirectUri;
+        if ($post !== null) {
+            $params['post_logout_redirect_uri'] = $post;
+        }
+        return $endpoint . ($params ? '?' . http_build_query($params) : '');
     }
 
     /**
@@ -188,26 +285,16 @@ final class Oidc
     public function logout(?string $returnTo = null, bool $providerLogout = true): void
     {
         $idToken = $this->user()?->idToken();
-        $this->config->session->remove(self::S_USER);
-        $this->config->session->remove(self::S_TX);
-        $this->config->session->regenerate();
+        $this->forgetUser();
 
         $post = $returnTo ?? $this->config->postLogoutRedirectUri;
 
         if ($providerLogout) {
-            $endpoint = $this->discovery->endSessionEndpoint();
-            if ($endpoint !== null) {
-                $params = [];
-                if ($idToken !== null) {
-                    $params['id_token_hint'] = $idToken;
-                }
-                if ($post !== null) {
-                    $params['post_logout_redirect_uri'] = $post;
-                }
-                $this->redirect($endpoint . ($params ? '?' . http_build_query($params) : ''));
+            $url = $this->getLogoutUrl($post, $idToken);
+            if ($url !== null) {
+                $this->redirect($url);
             }
         }
-
         if ($post !== null) {
             $this->redirect($post);
         }

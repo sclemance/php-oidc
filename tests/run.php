@@ -212,6 +212,50 @@ try {
     $_GET = ['state' => 'st', 'code' => 'abc'];
     try { (new Oidc($cfg($s, $c, $issuer, $client)))->handleCallback(); ok(false, 'forged'); }
     catch (AuthenticationException $e) { ok(str_contains($e->getMessage(), 'signature'), 'forged-signature rejected'); }
+
+    // store_tokens => false: user returned with tokens in-memory, but NOT persisted
+    $s = new ArraySession(); $c = new ArrayCache();
+    $s->set('tx', ['state' => 'st', 'nonce' => 'no', 'verifier' => 'v', 'return' => '/', 'ts' => time()]);
+    $writeToken($tokenFile, $mintFor($privPem, $issuer, $client, ['nonce' => 'no']));
+    $_GET = ['state' => 'st', 'code' => 'abc'];
+    $o = new Oidc($cfg($s, $c, $issuer, $client, ['store_tokens' => false]));
+    $u = $o->handleCallback();
+    ok($u->accessToken() === 'at', 'store_tokens=false: token available this request');
+    ok(($s->get('user')['tokens'] ?? []) === [], 'store_tokens=false: tokens not persisted');
+    ok($o->user()?->accessToken() === null, 'store_tokens=false: no token in later request');
+
+    // absolute timeout: a session older than the absolute TTL is treated as signed out
+    $s = new ArraySession(); $c = new ArrayCache();
+    $s->set('tx', ['state' => 'st', 'nonce' => 'no', 'verifier' => 'v', 'return' => '/', 'ts' => time()]);
+    $writeToken($tokenFile, $mintFor($privPem, $issuer, $client, ['nonce' => 'no']));
+    $_GET = ['state' => 'st', 'code' => 'abc'];
+    $o = new Oidc($cfg($s, $c, $issuer, $client, ['session_absolute_ttl' => 1]));
+    $o->handleCallback();
+    ok($o->isAuthenticated(), 'absolute ttl: authenticated immediately after login');
+    $s->d['meta']['auth_time'] = time() - 10; // simulate 10s elapsed vs 1s TTL
+    ok($o->user() === null, 'absolute ttl: expired session cleared');
+    ok($s->get('user') === null, 'absolute ttl: user removed from store');
+
+    // idle timeout: inactivity beyond idle TTL signs the user out
+    $s = new ArraySession(); $c = new ArrayCache();
+    $s->set('tx', ['state' => 'st', 'nonce' => 'no', 'verifier' => 'v', 'return' => '/', 'ts' => time()]);
+    $writeToken($tokenFile, $mintFor($privPem, $issuer, $client, ['nonce' => 'no']));
+    $_GET = ['state' => 'st', 'code' => 'abc'];
+    $o = new Oidc($cfg($s, $c, $issuer, $client, ['session_idle_ttl' => 1]));
+    $o->handleCallback();
+    $s->d['meta']['last_seen'] = time() - 10;
+    ok($o->user() === null, 'idle ttl: idle session cleared');
+
+    // getAuthorizationUrl primitive: builds URL + tx, no redirect/exit
+    $s = new ArraySession(); $c = new ArrayCache();
+    $o = new Oidc($cfg($s, $c, $issuer, $client));
+    $url = $o->getAuthorizationUrl('http://app.test/back');
+    ok(str_contains($url, "$issuer/authorize") && str_contains($url, 'code_challenge='), 'getAuthorizationUrl returns URL with PKCE');
+    ok(($s->get('tx')['return'] ?? null) === 'http://app.test/back', 'getAuthorizationUrl stored return + tx');
+
+    // getLogoutUrl primitive
+    $logout = $o->getLogoutUrl('http://app.test/bye', 'idhint');
+    ok($logout !== null && str_contains($logout, '/logout') && str_contains($logout, 'post_logout_redirect_uri='), 'getLogoutUrl builds end-session URL');
 } finally {
     if (isset($proc) && is_resource($proc)) {
         proc_terminate($proc);
