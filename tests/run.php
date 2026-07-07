@@ -12,6 +12,12 @@ declare(strict_types=1);
  * Authorization Code flow through the public Oidc API.
  */
 
+// CLI only. This runner spawns a subprocess (php -S); never allow it to run over HTTP.
+if (PHP_SAPI !== 'cli') {
+    http_response_code(403);
+    exit('This test runner is command-line only.');
+}
+
 require __DIR__ . '/../autoload.php';
 
 use Sclemance\Oidc\Jwk;
