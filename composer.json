@@ -1,0 +1,31 @@
+{
+    "name": "sclemance/php-oidc",
+    "description": "A small, zero-dependency, framework-agnostic OpenID Connect (OIDC) library for PHP. Drop-in auth with a single auto-checking call.",
+    "type": "library",
+    "keywords": ["oidc", "openid-connect", "oauth2", "authentication", "sso", "pkce", "entra", "azure-ad", "keycloak", "auth0", "okta", "google"],
+    "license": "MIT",
+    "authors": [
+        {
+            "name": "Stan Clemance"
+        }
+    ],
+    "require": {
+        "php": ">=8.1",
+        "ext-openssl": "*",
+        "ext-json": "*"
+    },
+    "suggest": {
+        "ext-curl": "Used for outbound HTTP when allow_url_fopen is disabled."
+    },
+    "autoload": {
+        "psr-4": {
+            "Sclemance\\Oidc\\": "src/"
+        }
+    },
+    "config": {
+        "sort-packages": true
+    },
+    "scripts": {
+        "test": "php tests/run.php"
+    }
+}
