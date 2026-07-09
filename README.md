@@ -212,6 +212,58 @@ It installs `Microsoft.Graph.Applications` on first run and connects with the
 `Application.ReadWrite.All` scope. Copy the printed **client secret immediately** — Entra shows
 it only once.
 
+By default the app is set to **require user assignment** — only users/groups you assign can
+sign in, which is the more secure stance. Pass `-NoAssignmentRequired` to leave it open to any
+user in the tenant. To grant access to a specific security group, add `-AssignGroup`:
+
+```powershell
+./scripts/provision-entra.ps1 `
+    -DisplayName "Acme Intranet - OIDC" `
+    -RedirectUri "https://intranet.acme.com/callback.php" `
+    -AssignGroup "Acme Staff"
+```
+
+`-AssignGroup` takes a group display name or object id and is best-effort: **group-based app
+assignment requires Entra ID P1 or higher.** On the free tier the script warns and continues —
+assign individual users in the portal instead (Enterprise applications → your app → Users and
+groups). This is enforced by Entra (unassigned users never get a token) and is independent of
+php-oidc's own `authorize` closure, which runs in your app after sign-in; the two complement
+each other.
+
+#### Updating an existing app (redirect URIs / secret rotation)
+
+Once the app exists, [`scripts/update-entra.ps1`](scripts/update-entra.ps1) changes its redirect
+URIs and rotates the client secret without recreating the registration. Locate the app by
+`-ClientId` (preferred) or `-DisplayName`.
+
+```powershell
+# Add a redirect URI and rotate the secret, keeping the old one alive (zero-downtime).
+./scripts/update-entra.ps1 -DisplayName "Acme Intranet - OIDC" `
+    -AddRedirect "https://intranet.acme.com/callback.php" -RenewSecret
+
+# Rotate the secret and remove the previous one.
+./scripts/update-entra.ps1 -ClientId <client-id> -RenewSecret -PruneOldSecrets
+
+# Just inspect current redirect URIs and secret expiry.
+./scripts/update-entra.ps1 -DisplayName "Acme Intranet - OIDC"
+```
+
+By default a renewed secret is added alongside the existing one so nothing breaks mid-deploy;
+add `-PruneOldSecrets` to remove the old secret once the new one is live. Use
+`-ReplaceRedirects` to swap the whole redirect set, or `-RemoveRedirect` to drop one. When
+anything changes it prints an updated paste-ready config block. Supports `-WhatIf` for a dry run.
+
+It can also manage the assignment gate on an existing app with the same `-AssignGroup` /
+`-RequireAssignment` / `-NoAssignmentRequired` options (creating the enterprise app if needed):
+
+```powershell
+# Restrict an existing app to a security group (also requires assignment).
+./scripts/update-entra.ps1 -DisplayName "Acme Intranet - OIDC" -AssignGroup "Acme Staff"
+```
+
+Unlike provisioning, update-entra touches the access posture **only when you pass one of those
+options** — a plain secret rotation or redirect change never alters who can sign in.
+
 ### Option B — Azure CLI
 
 ```bash

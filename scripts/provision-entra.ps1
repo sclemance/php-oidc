@@ -1,7 +1,6 @@
-#Requires -Version 7.0
 <#
 .SYNOPSIS
-    Provision a Microsoft Entra ID app registration for use with sclemance/php-oidc.
+    Provision a Microsoft Entra ID app registration.
 
 .DESCRIPTION
     Creates a single-tenant web app registration with the given redirect URI(s), adds a
@@ -33,7 +32,17 @@
 
 .PARAMETER CreateServicePrincipal
     Also create the enterprise application (service principal). Recommended so the app shows
-    up under Enterprise applications and can be assigned/conditional-access-scoped.
+    up under Enterprise applications and can be assigned/conditional-access-scoped. Implied
+    whenever assignment is managed (the default) or -AssignGroup is used.
+
+.PARAMETER NoAssignmentRequired
+    By default the app is set to require user assignment (appRoleAssignmentRequired = true), so
+    only assigned users/groups can sign in — the more secure stance. Pass this switch to leave
+    the app open to any user in the tenant instead.
+
+.PARAMETER AssignGroup
+    Security group (object id or display name) to grant access to the app. Attempted only if
+    given; if Entra refuses (group-based assignment needs Entra ID P1+), it warns and continues.
 
 .PARAMETER UseDeviceCode
     Sign in with a device code instead of opening a browser (for headless / SSH sessions).
@@ -45,7 +54,13 @@
 .EXAMPLE
     ./provision-entra.ps1 -DisplayName "Acme Intranet - OIDC" `
         -RedirectUri "https://intranet.acme.com/callback.php" -CreateServicePrincipal
+
+.EXAMPLE
+    # Restrict sign-in to a security group (requires Entra ID P1+ for group assignment).
+    ./provision-entra.ps1 -DisplayName "Acme Intranet - OIDC" `
+        -RedirectUri "https://intranet.acme.com/callback.php" -AssignGroup "Acme Staff"
 #>
+#Requires -Version 7.0
 
 [CmdletBinding()]
 param(
@@ -61,6 +76,12 @@ param(
     [int]$SecretYears = 1,
 
     [switch]$CreateServicePrincipal,
+
+    # Leave the app open to any tenant user. By default the app requires user assignment.
+    [switch]$NoAssignmentRequired,
+
+    # Security group (object id or display name) to grant access to. Best-effort: needs P1+.
+    [string]$AssignGroup,
 
     # Sign in with a device code (prints a code + URL) instead of opening a browser.
     # Use this on headless/SSH sessions with no local browser.
@@ -83,7 +104,9 @@ Import-Module Microsoft.Graph.Applications
 # --- 2. Connect (needs permission to create app registrations) -------------------------
 # RoleManagement.Read.Directory + User.Read let us verify the signed-in user's role before
 # attempting to create anything. Application.ReadWrite.All is needed to create the app.
-$connectArgs = @{ Scopes = @('Application.ReadWrite.All', 'RoleManagement.Read.Directory', 'User.Read') }
+$scopes = @('Application.ReadWrite.All', 'RoleManagement.Read.Directory', 'User.Read')
+if ($AssignGroup) { $scopes += @('Group.Read.All', 'AppRoleAssignment.ReadWrite.All') }
+$connectArgs = @{ Scopes = $scopes }
 if ($TenantId)      { $connectArgs.TenantId = $TenantId }
 if ($UseDeviceCode) { $connectArgs.UseDeviceCode = $true }
 Write-Host "Connecting to Microsoft Graph..." -ForegroundColor Cyan
@@ -170,10 +193,42 @@ $secret = Add-MgApplicationPassword -ApplicationId $appObjectId -PasswordCredent
 }
 $clientSecret = $secret.SecretText
 
-# --- 5. Optionally create the service principal (enterprise app) ------------------------
-if ($CreateServicePrincipal) {
+# --- 5. Service principal (enterprise app), assignment gate, group assignment -----------
+# Requiring assignment and assigning a group both live on the service principal, so create it
+# whenever we manage assignment (the default) or a group was requested.
+$assignmentRequired = -not $NoAssignmentRequired
+$sp = $null
+if ($CreateServicePrincipal -or $assignmentRequired -or $AssignGroup) {
     Write-Host "Creating service principal (enterprise application)..." -ForegroundColor Cyan
-    New-MgServicePrincipal -AppId $clientId | Out-Null
+    $sp = New-MgServicePrincipal -AppId $clientId
+
+    Write-Host "Setting user assignment required = $assignmentRequired..." -ForegroundColor Cyan
+    Update-MgServicePrincipal -ServicePrincipalId $sp.Id -AppRoleAssignmentRequired:$assignmentRequired
+
+    if ($AssignGroup) {
+        try {
+            if ($AssignGroup -match '^[0-9a-fA-F-]{36}$') {
+                $group = Invoke-MgGraphRequest -Method GET -OutputType PSObject `
+                    -Uri "https://graph.microsoft.com/v1.0/groups/$AssignGroup`?`$select=id,displayName"
+            } else {
+                $safeGroup = $AssignGroup -replace "'", "''"
+                $resp = Invoke-MgGraphRequest -Method GET -OutputType PSObject `
+                    -Uri "https://graph.microsoft.com/v1.0/groups`?`$filter=displayName eq '$safeGroup'&`$select=id,displayName"
+                $found = @($resp.value)
+                if ($found.Count -eq 0) { throw "No group named '$AssignGroup' found." }
+                if ($found.Count -gt 1) { throw "More than one group named '$AssignGroup'; pass the object id instead." }
+                $group = $found[0]
+            }
+            New-MgServicePrincipalAppRoleAssignedTo -ServicePrincipalId $sp.Id -BodyParameter @{
+                PrincipalId = $group.id; ResourceId = $sp.Id
+                AppRoleId   = '00000000-0000-0000-0000-000000000000'   # default access (no app roles defined)
+            } | Out-Null
+            Write-Host "Assigned group '$($group.displayName)' to the app." -ForegroundColor Green
+        } catch {
+            Write-Warning "Could not assign group '$AssignGroup': $($_.Exception.Message)"
+            Write-Warning "Group-based app assignment requires Entra ID P1 or higher. On the free tier, assign individual users in the portal (Enterprise applications > your app > Users and groups)."
+        }
+    }
 }
 
 # --- 6. Output -------------------------------------------------------------------------
@@ -188,6 +243,7 @@ Write-Host "Secret expires       : $((Get-Date).AddYears($SecretYears).ToString(
 Write-Host "Issuer               : $issuer"
 Write-Host "Discovery URL        : $issuer/.well-known/openid-configuration"
 Write-Host "Redirect URI(s)      : $($RedirectUri -join ', ')"
+if ($sp) { Write-Host "Assignment required  : $assignmentRequired$(if ($AssignGroup) { " (group: $AssignGroup)" })" }
 Write-Host ""
 Write-Host "-------- Paste into your php-oidc config --------" -ForegroundColor Yellow
 @"
