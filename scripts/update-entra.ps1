@@ -60,6 +60,27 @@
     Security group (object id or display name) whose access assignment should be removed from
     the app. Also engages assignment management. No-op (with a note) if the group isn't assigned.
 
+.PARAMETER AssignMembersOf
+    Security group (object id or display name) whose members are each assigned to the app
+    INDIVIDUALLY. This is the free-tier alternative to -AssignGroup (per-user assignment needs no
+    Entra ID P1). Includes users in nested groups (transitive). IMPORTANT: it is a point-in-time
+    snapshot — later membership changes are not tracked; re-run to reconcile.
+
+.PARAMETER RemoveMembersOf
+    Security group (object id or display name) whose members' individual assignments are removed.
+    Only affects users currently in the group; someone who already left keeps a stale assignment
+    (use -ClearAssignments to fully reset).
+
+.PARAMETER AssignMember
+    One or more users (object id or UPN) to assign to the app individually.
+
+.PARAMETER RemoveMember
+    One or more users (object id or UPN) whose individual assignment is removed.
+
+.PARAMETER ClearAssignments
+    Remove ALL current assignments (users and groups) from the app. Handy before re-flattening a
+    group with -AssignMembersOf.
+
 .PARAMETER RequireAssignment
     Set the app to require user assignment (appRoleAssignmentRequired = true) — only assigned
     users/groups can sign in. Implied when -AssignGroup is used.
@@ -75,10 +96,12 @@
     Sign in with a device code instead of opening a browser (for headless / SSH sessions).
 
 .NOTES
-    Assignment is managed only when you ask for it (-AssignGroup / -RemoveGroup /
+    Assignment is managed only when you ask for it (any of -AssignGroup / -RemoveGroup /
+    -AssignMembersOf / -RemoveMembersOf / -AssignMember / -RemoveMember / -ClearAssignments /
     -RequireAssignment / -NoAssignmentRequired). A plain secret rotation, rename, or redirect
     change never alters the app's access posture. When you do engage it, requiring assignment is
-    the default (the secure stance); disable with -NoAssignmentRequired.
+    the default (the secure stance); disable with -NoAssignmentRequired. Within a single run the
+    order is: clear, then removals, then additions.
 
 .EXAMPLE
     # Add a redirect URI and rotate the secret, keeping the old one alive.
@@ -97,6 +120,16 @@
     # Remove a group's access and rename the app.
     ./update-entra.ps1 -DisplayName "Acme Intranet - OIDC" `
         -RemoveGroup "Acme Contractors" -RenameDisplayName "Acme Portal - OIDC"
+
+.EXAMPLE
+    # Free-tier "group" access: reset assignments, then flatten a group to per-user assignments.
+    ./update-entra.ps1 -DisplayName "Acme Intranet - OIDC" `
+        -ClearAssignments -AssignMembersOf "Acme Staff"
+
+.EXAMPLE
+    # Assign and remove individual users.
+    ./update-entra.ps1 -DisplayName "Acme Intranet - OIDC" `
+        -AssignMember alice@acme.com,bob@acme.com -RemoveMember carol@acme.com
 
 .EXAMPLE
     # Just inspect current redirect URIs and secret expiry.
@@ -121,6 +154,11 @@ param(
 
     [string]$AssignGroup,
     [string]$RemoveGroup,
+    [string]$AssignMembersOf,
+    [string]$RemoveMembersOf,
+    [string[]]$AssignMember,
+    [string[]]$RemoveMember,
+    [switch]$ClearAssignments,
     [switch]$RequireAssignment,
     [switch]$NoAssignmentRequired,
 
@@ -138,7 +176,9 @@ if (-not $ClientId -and -not $DisplayName) {
 if ($RequireAssignment -and $NoAssignmentRequired) {
     throw 'Pass only one of -RequireAssignment or -NoAssignmentRequired.'
 }
-$manageAssignment = [bool]$AssignGroup -or [bool]$RemoveGroup -or $RequireAssignment -or $NoAssignmentRequired
+$manageAssignment = [bool]$AssignGroup -or [bool]$RemoveGroup -or [bool]$AssignMembersOf -or
+    [bool]$RemoveMembersOf -or [bool]$AssignMember -or [bool]$RemoveMember -or $ClearAssignments -or
+    $RequireAssignment -or $NoAssignmentRequired
 
 # Resolve a security group by object id or display name to a { id, displayName } object.
 function Resolve-EntraGroup([string]$idOrName) {
@@ -155,6 +195,44 @@ function Resolve-EntraGroup([string]$idOrName) {
     return $found[0]
 }
 
+# Resolve a user by object id or UPN to a { id, userPrincipalName } object.
+function Resolve-EntraUser([string]$idOrUpn) {
+    $enc = [uri]::EscapeDataString($idOrUpn)
+    return Invoke-MgGraphRequest -Method GET -OutputType PSObject `
+        -Uri "https://graph.microsoft.com/v1.0/users/$enc`?`$select=id,userPrincipalName"
+}
+
+# All transitive USER members of a group (flattens nested groups), with paging.
+function Get-EntraGroupUserMembers([string]$groupId) {
+    $users = @()
+    $uri = "https://graph.microsoft.com/v1.0/groups/$groupId/transitiveMembers/microsoft.graph.user`?`$select=id,userPrincipalName&`$top=999"
+    while ($uri) {
+        $resp = Invoke-MgGraphRequest -Method GET -OutputType PSObject -Uri $uri
+        $users += @($resp.value)
+        $uri = $resp.'@odata.nextLink'
+    }
+    return $users
+}
+
+# Assign / unassign a principal (user or group) using a shared principalId -> assignmentId map,
+# so a whole batch costs one initial read instead of one read per principal. $map is a hashtable
+# (reference type), so these mutate it in place for the caller.
+function Add-EntraAssignment($sp, $map, [string]$principalId, [string]$label) {
+    if ($map.ContainsKey($principalId)) { Write-Host "  $label already assigned." -ForegroundColor DarkGray; return }
+    $res = New-MgServicePrincipalAppRoleAssignedTo -ServicePrincipalId $sp.Id -BodyParameter @{
+        PrincipalId = $principalId; ResourceId = $sp.Id
+        AppRoleId   = '00000000-0000-0000-0000-000000000000'   # default access (no app roles defined)
+    }
+    $map[$principalId] = $res.Id
+    Write-Host "  assigned $label." -ForegroundColor Green
+}
+function Remove-EntraAssignment($sp, $map, [string]$principalId, [string]$label) {
+    if (-not $map.ContainsKey($principalId)) { Write-Host "  $label not assigned; nothing to remove." -ForegroundColor DarkGray; return }
+    Remove-MgServicePrincipalAppRoleAssignedTo -ServicePrincipalId $sp.Id -AppRoleAssignmentId $map[$principalId]
+    $map.Remove($principalId)
+    Write-Host "  removed $label." -ForegroundColor Green
+}
+
 # --- 1. Ensure the Graph Applications module is available -------------------------------
 if (-not (Get-Module -ListAvailable -Name Microsoft.Graph.Applications)) {
     Write-Host "Installing Microsoft.Graph.Applications module (current user scope)..." -ForegroundColor Cyan
@@ -164,8 +242,12 @@ Import-Module Microsoft.Graph.Applications
 
 # --- 2. Connect (needs permission to modify app registrations) -------------------------
 $scopes = @('Application.ReadWrite.All')
-if ($AssignGroup -or $RemoveGroup) { $scopes += @('Group.Read.All', 'AppRoleAssignment.ReadWrite.All') }
-$connectArgs = @{ Scopes = $scopes }
+if ($AssignGroup -or $RemoveGroup -or $AssignMembersOf -or $RemoveMembersOf) { $scopes += 'Group.Read.All' }
+if ($AssignMembersOf -or $RemoveMembersOf) { $scopes += 'GroupMember.Read.All' }
+if ($AssignMember -or $RemoveMember)       { $scopes += 'User.ReadBasic.All' }
+if ($AssignGroup -or $RemoveGroup -or $AssignMembersOf -or $RemoveMembersOf -or
+    $AssignMember -or $RemoveMember -or $ClearAssignments) { $scopes += 'AppRoleAssignment.ReadWrite.All' }
+$connectArgs = @{ Scopes = ($scopes | Select-Object -Unique) }
 if ($TenantId)      { $connectArgs.TenantId = $TenantId }
 if ($UseDeviceCode) { $connectArgs.UseDeviceCode = $true }
 Write-Host "Connecting to Microsoft Graph..." -ForegroundColor Cyan
@@ -247,7 +329,7 @@ try {
         }
     }
 
-    # --- 5b. Assignment gate + group assignment (only when asked) ----------------------
+    # --- 5b. Assignment gate + group/user assignment (only when asked) -----------------
     # These live on the service principal (enterprise app), so ensure one exists first.
     if ($manageAssignment) {
         $sp = Get-MgServicePrincipal -Filter "appId eq '$($app.AppId)'" -ErrorAction SilentlyContinue
@@ -265,41 +347,73 @@ try {
                 Write-Host "User assignment required = $assignmentRequired." -ForegroundColor Green
             }
 
-            if ($AssignGroup -and $PSCmdlet.ShouldProcess($app.DisplayName, "Assign group '$AssignGroup'")) {
-                try {
-                    $group = Resolve-EntraGroup $AssignGroup
-                    $already = Get-MgServicePrincipalAppRoleAssignedTo -ServicePrincipalId $sp.Id -All |
-                        Where-Object { $_.PrincipalId -eq $group.id }
-                    if ($already) {
-                        Write-Host "Group '$($group.displayName)' is already assigned." -ForegroundColor DarkGray
-                    } else {
-                        New-MgServicePrincipalAppRoleAssignedTo -ServicePrincipalId $sp.Id -BodyParameter @{
-                            PrincipalId = $group.id; ResourceId = $sp.Id
-                            AppRoleId   = '00000000-0000-0000-0000-000000000000'   # default access (no app roles defined)
-                        } | Out-Null
-                        Write-Host "Assigned group '$($group.displayName)' to the app." -ForegroundColor Green
-                    }
-                } catch {
-                    Write-Warning "Could not assign group '$AssignGroup': $($_.Exception.Message)"
-                    Write-Warning "Group-based app assignment requires Entra ID P1 or higher. On the free tier, assign individual users in the portal (Enterprise applications > your app > Users and groups)."
+            # Read the current assignments once; the helpers keep this map in sync as we go.
+            $assignMap = @{}
+            foreach ($a in (Get-MgServicePrincipalAppRoleAssignedTo -ServicePrincipalId $sp.Id -All)) {
+                $assignMap[$a.PrincipalId] = $a.Id
+            }
+
+            # 1) Clear, then removals, then additions — so a "reset and re-flatten" run is coherent.
+            if ($ClearAssignments -and $PSCmdlet.ShouldProcess($app.DisplayName, "Remove ALL $($assignMap.Count) assignment(s)")) {
+                $n = $assignMap.Count
+                foreach ($key in @($assignMap.Keys)) {
+                    Remove-MgServicePrincipalAppRoleAssignedTo -ServicePrincipalId $sp.Id -AppRoleAssignmentId $assignMap[$key]
                 }
+                $assignMap.Clear()
+                Write-Host "Cleared $n assignment(s)." -ForegroundColor Green
             }
 
             if ($RemoveGroup -and $PSCmdlet.ShouldProcess($app.DisplayName, "Remove group '$RemoveGroup'")) {
                 try {
                     $group = Resolve-EntraGroup $RemoveGroup
-                    $assignment = Get-MgServicePrincipalAppRoleAssignedTo -ServicePrincipalId $sp.Id -All |
-                        Where-Object { $_.PrincipalId -eq $group.id }
-                    if ($assignment) {
-                        $assignment | ForEach-Object {
-                            Remove-MgServicePrincipalAppRoleAssignedTo -ServicePrincipalId $sp.Id -AppRoleAssignmentId $_.Id
-                        }
-                        Write-Host "Removed group '$($group.displayName)' from the app." -ForegroundColor Green
-                    } else {
-                        Write-Host "Group '$($group.displayName)' was not assigned; nothing to remove." -ForegroundColor DarkGray
-                    }
+                    Remove-EntraAssignment $sp $assignMap $group.id "group '$($group.displayName)'"
+                } catch { Write-Warning "Could not remove group '$RemoveGroup': $($_.Exception.Message)" }
+            }
+
+            if ($RemoveMembersOf -and $PSCmdlet.ShouldProcess($app.DisplayName, "Remove all members of group '$RemoveMembersOf'")) {
+                try {
+                    $group = Resolve-EntraGroup $RemoveMembersOf
+                    $members = Get-EntraGroupUserMembers $group.id
+                    Write-Host "Unassigning $($members.Count) user member(s) of '$($group.displayName)'..." -ForegroundColor Cyan
+                    foreach ($u in $members) { Remove-EntraAssignment $sp $assignMap $u.id "user '$($u.userPrincipalName)'" }
+                } catch { Write-Warning "Could not remove members of '$RemoveMembersOf': $($_.Exception.Message)" }
+            }
+
+            foreach ($m in @($RemoveMember)) {
+                if ($PSCmdlet.ShouldProcess($app.DisplayName, "Remove user '$m'")) {
+                    try {
+                        $u = Resolve-EntraUser $m
+                        Remove-EntraAssignment $sp $assignMap $u.id "user '$($u.userPrincipalName)'"
+                    } catch { Write-Warning "Could not remove user '$m': $($_.Exception.Message)" }
+                }
+            }
+
+            if ($AssignGroup -and $PSCmdlet.ShouldProcess($app.DisplayName, "Assign group '$AssignGroup'")) {
+                try {
+                    $group = Resolve-EntraGroup $AssignGroup
+                    Add-EntraAssignment $sp $assignMap $group.id "group '$($group.displayName)'"
                 } catch {
-                    Write-Warning "Could not remove group '$RemoveGroup': $($_.Exception.Message)"
+                    Write-Warning "Could not assign group '$AssignGroup': $($_.Exception.Message)"
+                    Write-Warning "Group-based app assignment requires Entra ID P1 or higher. On the free tier, assign individual users with -AssignMember / -AssignMembersOf instead."
+                }
+            }
+
+            if ($AssignMembersOf -and $PSCmdlet.ShouldProcess($app.DisplayName, "Assign all members of group '$AssignMembersOf'")) {
+                try {
+                    $group = Resolve-EntraGroup $AssignMembersOf
+                    $members = Get-EntraGroupUserMembers $group.id
+                    Write-Host "Assigning $($members.Count) user member(s) of '$($group.displayName)' (transitive)..." -ForegroundColor Cyan
+                    foreach ($u in $members) { Add-EntraAssignment $sp $assignMap $u.id "user '$($u.userPrincipalName)'" }
+                    Write-Warning "This is a point-in-time snapshot of the group; membership changes are NOT tracked. Re-run to reconcile."
+                } catch { Write-Warning "Could not assign members of '$AssignMembersOf': $($_.Exception.Message)" }
+            }
+
+            foreach ($m in @($AssignMember)) {
+                if ($PSCmdlet.ShouldProcess($app.DisplayName, "Assign user '$m'")) {
+                    try {
+                        $u = Resolve-EntraUser $m
+                        Add-EntraAssignment $sp $assignMap $u.id "user '$($u.userPrincipalName)'"
+                    } catch { Write-Warning "Could not assign user '$m': $($_.Exception.Message)" }
                 }
             }
         }

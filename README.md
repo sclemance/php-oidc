@@ -254,8 +254,9 @@ add `-PruneOldSecrets` to remove the old secret once the new one is live. Use
 anything changes it prints an updated paste-ready config block. Supports `-WhatIf` for a dry run.
 
 It can also rename the app (`-RenameDisplayName`, which also renames the enterprise app) and
-manage the assignment gate on an existing app with `-AssignGroup` / `-RemoveGroup` /
-`-RequireAssignment` / `-NoAssignmentRequired` (creating the enterprise app if needed):
+manage the assignment gate on an existing app: `-AssignGroup` / `-RemoveGroup`,
+`-AssignMember` / `-RemoveMember` (individual users), `-ClearAssignments`, and
+`-RequireAssignment` / `-NoAssignmentRequired` (the enterprise app is created if needed):
 
 ```powershell
 # Restrict an existing app to a security group (also requires assignment).
@@ -264,11 +265,26 @@ manage the assignment gate on an existing app with `-AssignGroup` / `-RemoveGrou
 # Remove a group's access and rename the app.
 ./scripts/update-entra.ps1 -DisplayName "Acme Intranet - OIDC" `
     -RemoveGroup "Acme Contractors" -RenameDisplayName "Acme Portal - OIDC"
+
+# Assign / remove individual users.
+./scripts/update-entra.ps1 -DisplayName "Acme Intranet - OIDC" `
+    -AssignMember alice@acme.com,bob@acme.com -RemoveMember carol@acme.com
+```
+
+**Free tier without P1?** Use `-AssignMembersOf` to assign a group's members *individually*
+(the per-user assignment that free tenants allow), which sidesteps the P1 requirement of
+`-AssignGroup`. It flattens nested groups (transitive) but is a **point-in-time snapshot** — it
+doesn't track later membership changes, so re-run it to reconcile. Pair with `-ClearAssignments`
+to reset first:
+
+```powershell
+./scripts/update-entra.ps1 -DisplayName "Acme Intranet - OIDC" `
+    -ClearAssignments -AssignMembersOf "Acme Staff"
 ```
 
 Unlike provisioning, update-entra touches the access posture **only when you pass one of the
 assignment options** — a plain secret rotation, rename, or redirect change never alters who can
-sign in.
+sign in. Within one run the order is: clear → removals → additions.
 
 ### Option B — Azure CLI
 
