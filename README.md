@@ -253,16 +253,22 @@ add `-PruneOldSecrets` to remove the old secret once the new one is live. Use
 `-ReplaceRedirects` to swap the whole redirect set, or `-RemoveRedirect` to drop one. When
 anything changes it prints an updated paste-ready config block. Supports `-WhatIf` for a dry run.
 
-It can also manage the assignment gate on an existing app with the same `-AssignGroup` /
-`-RequireAssignment` / `-NoAssignmentRequired` options (creating the enterprise app if needed):
+It can also rename the app (`-RenameDisplayName`, which also renames the enterprise app) and
+manage the assignment gate on an existing app with `-AssignGroup` / `-RemoveGroup` /
+`-RequireAssignment` / `-NoAssignmentRequired` (creating the enterprise app if needed):
 
 ```powershell
 # Restrict an existing app to a security group (also requires assignment).
 ./scripts/update-entra.ps1 -DisplayName "Acme Intranet - OIDC" -AssignGroup "Acme Staff"
+
+# Remove a group's access and rename the app.
+./scripts/update-entra.ps1 -DisplayName "Acme Intranet - OIDC" `
+    -RemoveGroup "Acme Contractors" -RenameDisplayName "Acme Portal - OIDC"
 ```
 
-Unlike provisioning, update-entra touches the access posture **only when you pass one of those
-options** — a plain secret rotation or redirect change never alters who can sign in.
+Unlike provisioning, update-entra touches the access posture **only when you pass one of the
+assignment options** — a plain secret rotation, rename, or redirect change never alters who can
+sign in.
 
 ### Option B — Azure CLI
 

@@ -25,6 +25,10 @@
 .PARAMETER DisplayName
     Locate the app by display name instead (must match exactly one registration).
 
+.PARAMETER RenameDisplayName
+    New display name for the app registration. The enterprise application (service principal),
+    if one exists, is renamed to match.
+
 .PARAMETER AddRedirect
     One or more redirect URIs to add. Merged with the existing set unless -ReplaceRedirects.
     HTTPS required (http://localhost is allowed for local testing).
@@ -52,6 +56,10 @@
     Best-effort — if Entra refuses (group-based assignment needs Entra ID P1+), it warns and
     continues.
 
+.PARAMETER RemoveGroup
+    Security group (object id or display name) whose access assignment should be removed from
+    the app. Also engages assignment management. No-op (with a note) if the group isn't assigned.
+
 .PARAMETER RequireAssignment
     Set the app to require user assignment (appRoleAssignmentRequired = true) — only assigned
     users/groups can sign in. Implied when -AssignGroup is used.
@@ -67,10 +75,10 @@
     Sign in with a device code instead of opening a browser (for headless / SSH sessions).
 
 .NOTES
-    Assignment is managed only when you ask for it (-AssignGroup / -RequireAssignment /
-    -NoAssignmentRequired). A plain secret rotation or redirect change never alters the app's
-    access posture. When you do engage it, requiring assignment is the default (the secure
-    stance); disable with -NoAssignmentRequired.
+    Assignment is managed only when you ask for it (-AssignGroup / -RemoveGroup /
+    -RequireAssignment / -NoAssignmentRequired). A plain secret rotation, rename, or redirect
+    change never alters the app's access posture. When you do engage it, requiring assignment is
+    the default (the secure stance); disable with -NoAssignmentRequired.
 
 .EXAMPLE
     # Add a redirect URI and rotate the secret, keeping the old one alive.
@@ -86,6 +94,11 @@
     ./update-entra.ps1 -DisplayName "Acme Intranet - OIDC" -AssignGroup "Acme Staff"
 
 .EXAMPLE
+    # Remove a group's access and rename the app.
+    ./update-entra.ps1 -DisplayName "Acme Intranet - OIDC" `
+        -RemoveGroup "Acme Contractors" -RenameDisplayName "Acme Portal - OIDC"
+
+.EXAMPLE
     # Just inspect current redirect URIs and secret expiry.
     ./update-entra.ps1 -DisplayName "Acme Intranet - OIDC"
 #>
@@ -96,6 +109,8 @@ param(
     [string]$ClientId,
     [string]$DisplayName,
 
+    [string]$RenameDisplayName,
+
     [string[]]$AddRedirect,
     [string[]]$RemoveRedirect,
     [switch]$ReplaceRedirects,
@@ -105,6 +120,7 @@ param(
     [switch]$PruneOldSecrets,
 
     [string]$AssignGroup,
+    [string]$RemoveGroup,
     [switch]$RequireAssignment,
     [switch]$NoAssignmentRequired,
 
@@ -122,7 +138,22 @@ if (-not $ClientId -and -not $DisplayName) {
 if ($RequireAssignment -and $NoAssignmentRequired) {
     throw 'Pass only one of -RequireAssignment or -NoAssignmentRequired.'
 }
-$manageAssignment = [bool]$AssignGroup -or $RequireAssignment -or $NoAssignmentRequired
+$manageAssignment = [bool]$AssignGroup -or [bool]$RemoveGroup -or $RequireAssignment -or $NoAssignmentRequired
+
+# Resolve a security group by object id or display name to a { id, displayName } object.
+function Resolve-EntraGroup([string]$idOrName) {
+    if ($idOrName -match '^[0-9a-fA-F-]{36}$') {
+        return Invoke-MgGraphRequest -Method GET -OutputType PSObject `
+            -Uri "https://graph.microsoft.com/v1.0/groups/$idOrName`?`$select=id,displayName"
+    }
+    $safe = $idOrName -replace "'", "''"
+    $resp = Invoke-MgGraphRequest -Method GET -OutputType PSObject `
+        -Uri "https://graph.microsoft.com/v1.0/groups`?`$filter=displayName eq '$safe'&`$select=id,displayName"
+    $found = @($resp.value)
+    if ($found.Count -eq 0) { throw "No group named '$idOrName' found." }
+    if ($found.Count -gt 1) { throw "More than one group named '$idOrName'; pass the object id instead." }
+    return $found[0]
+}
 
 # --- 1. Ensure the Graph Applications module is available -------------------------------
 if (-not (Get-Module -ListAvailable -Name Microsoft.Graph.Applications)) {
@@ -133,7 +164,7 @@ Import-Module Microsoft.Graph.Applications
 
 # --- 2. Connect (needs permission to modify app registrations) -------------------------
 $scopes = @('Application.ReadWrite.All')
-if ($AssignGroup) { $scopes += @('Group.Read.All', 'AppRoleAssignment.ReadWrite.All') }
+if ($AssignGroup -or $RemoveGroup) { $scopes += @('Group.Read.All', 'AppRoleAssignment.ReadWrite.All') }
 $connectArgs = @{ Scopes = $scopes }
 if ($TenantId)      { $connectArgs.TenantId = $TenantId }
 if ($UseDeviceCode) { $connectArgs.UseDeviceCode = $true }
@@ -155,6 +186,17 @@ try {
     }
     if (-not $app) { throw 'App registration not found.' }
     Write-Host "Found '$($app.DisplayName)' (client id $($app.AppId))." -ForegroundColor Green
+
+    # --- 3b. Rename ---------------------------------------------------------------------
+    if ($RenameDisplayName -and $RenameDisplayName -ne $app.DisplayName -and
+        $PSCmdlet.ShouldProcess($app.DisplayName, "Rename to '$RenameDisplayName'")) {
+        Update-MgApplication -ApplicationId $app.Id -DisplayName $RenameDisplayName
+        # Keep the enterprise app (service principal) name in sync if one exists.
+        $spRename = Get-MgServicePrincipal -Filter "appId eq '$($app.AppId)'" -ErrorAction SilentlyContinue
+        if ($spRename) { Update-MgServicePrincipal -ServicePrincipalId $spRename.Id -DisplayName $RenameDisplayName }
+        Write-Host "Renamed to '$RenameDisplayName'." -ForegroundColor Green
+        $app.DisplayName = $RenameDisplayName   # so later messages use the new name
+    }
 
     $current = @($app.Web.RedirectUris)
     Write-Host ("Current redirect URIs: " + $(if ($current) { $current -join ', ' } else { '(none)' }))
@@ -225,18 +267,7 @@ try {
 
             if ($AssignGroup -and $PSCmdlet.ShouldProcess($app.DisplayName, "Assign group '$AssignGroup'")) {
                 try {
-                    if ($AssignGroup -match '^[0-9a-fA-F-]{36}$') {
-                        $group = Invoke-MgGraphRequest -Method GET -OutputType PSObject `
-                            -Uri "https://graph.microsoft.com/v1.0/groups/$AssignGroup`?`$select=id,displayName"
-                    } else {
-                        $safeGroup = $AssignGroup -replace "'", "''"
-                        $resp = Invoke-MgGraphRequest -Method GET -OutputType PSObject `
-                            -Uri "https://graph.microsoft.com/v1.0/groups`?`$filter=displayName eq '$safeGroup'&`$select=id,displayName"
-                        $found = @($resp.value)
-                        if ($found.Count -eq 0) { throw "No group named '$AssignGroup' found." }
-                        if ($found.Count -gt 1) { throw "More than one group named '$AssignGroup'; pass the object id instead." }
-                        $group = $found[0]
-                    }
+                    $group = Resolve-EntraGroup $AssignGroup
                     $already = Get-MgServicePrincipalAppRoleAssignedTo -ServicePrincipalId $sp.Id -All |
                         Where-Object { $_.PrincipalId -eq $group.id }
                     if ($already) {
@@ -251,6 +282,24 @@ try {
                 } catch {
                     Write-Warning "Could not assign group '$AssignGroup': $($_.Exception.Message)"
                     Write-Warning "Group-based app assignment requires Entra ID P1 or higher. On the free tier, assign individual users in the portal (Enterprise applications > your app > Users and groups)."
+                }
+            }
+
+            if ($RemoveGroup -and $PSCmdlet.ShouldProcess($app.DisplayName, "Remove group '$RemoveGroup'")) {
+                try {
+                    $group = Resolve-EntraGroup $RemoveGroup
+                    $assignment = Get-MgServicePrincipalAppRoleAssignedTo -ServicePrincipalId $sp.Id -All |
+                        Where-Object { $_.PrincipalId -eq $group.id }
+                    if ($assignment) {
+                        $assignment | ForEach-Object {
+                            Remove-MgServicePrincipalAppRoleAssignedTo -ServicePrincipalId $sp.Id -AppRoleAssignmentId $_.Id
+                        }
+                        Write-Host "Removed group '$($group.displayName)' from the app." -ForegroundColor Green
+                    } else {
+                        Write-Host "Group '$($group.displayName)' was not assigned; nothing to remove." -ForegroundColor DarkGray
+                    }
+                } catch {
+                    Write-Warning "Could not remove group '$RemoveGroup': $($_.Exception.Message)"
                 }
             }
         }
