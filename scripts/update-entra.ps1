@@ -441,7 +441,7 @@ try {
                 } catch { Write-Warning "Could not remove members of '$RemoveMembersOf': $($_.Exception.Message)" }
             }
 
-            foreach ($m in @($RemoveMember)) {
+            foreach ($m in @($RemoveMember | Where-Object { $_ })) {
                 if ($PSCmdlet.ShouldProcess($app.DisplayName, "Remove user '$m'")) {
                     try {
                         $u = Resolve-EntraUser $m
@@ -470,7 +470,7 @@ try {
                 } catch { Write-Warning "Could not assign members of '$AssignMembersOf': $($_.Exception.Message)" }
             }
 
-            foreach ($m in @($AssignMember)) {
+            foreach ($m in @($AssignMember | Where-Object { $_ })) {
                 if ($PSCmdlet.ShouldProcess($app.DisplayName, "Assign user '$m'")) {
                     try {
                         $u = Resolve-EntraUser $m
