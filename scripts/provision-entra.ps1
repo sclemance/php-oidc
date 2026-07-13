@@ -44,6 +44,14 @@
     Security group (object id or display name) to grant access to the app. Attempted only if
     given; if Entra refuses (group-based assignment needs Entra ID P1+), it warns and continues.
 
+.PARAMETER AdminConsent
+    Grant tenant-wide admin consent for the app's delegated OIDC permissions (openid, profile,
+    email) so users are NEVER shown a consent prompt on first sign-in. Creates an AllPrincipals
+    oauth2PermissionGrant against Microsoft Graph. Needs the extra Graph scope
+    DelegatedPermissionGrant.ReadWrite.All and a role that can grant consent (Global
+    Administrator, Privileged Role Administrator, Application Administrator, or Cloud Application
+    Administrator). Best-effort: if the grant is refused it warns and continues.
+
 .PARAMETER UseDeviceCode
     Sign in with a device code instead of opening a browser (for headless / SSH sessions).
 
@@ -59,6 +67,11 @@
     # Restrict sign-in to a security group (requires Entra ID P1+ for group assignment).
     ./provision-entra.ps1 -DisplayName "Acme Intranet - OIDC" `
         -RedirectUri "https://intranet.acme.com/callback.php" -AssignGroup "Acme Staff"
+
+.EXAMPLE
+    # Same, plus tenant-wide admin consent so assigned users get zero prompts on first login.
+    ./provision-entra.ps1 -DisplayName "Acme Intranet - OIDC" `
+        -RedirectUri "https://intranet.acme.com/callback.php" -AssignGroup "Acme Staff" -AdminConsent
 #>
 #Requires -Version 7.0
 
@@ -83,6 +96,9 @@ param(
     # Security group (object id or display name) to grant access to. Best-effort: needs P1+.
     [string]$AssignGroup,
 
+    # Grant tenant-wide admin consent for openid/profile/email so users see no consent prompt.
+    [switch]$AdminConsent,
+
     # Sign in with a device code (prints a code + URL) instead of opening a browser.
     # Use this on headless/SSH sessions with no local browser.
     [switch]$UseDeviceCode,
@@ -93,6 +109,51 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+# Grant tenant-wide admin consent for the app's delegated OIDC scopes (openid/profile/email) by
+# creating (or extending) an AllPrincipals oauth2PermissionGrant against Microsoft Graph. This is
+# what the portal's "Grant admin consent" button does; once present, users get no consent prompt.
+# Returns $true on success. Best-effort: warns and returns $false if the grant is refused.
+function Set-EntraAdminConsent {
+    param(
+        [Parameter(Mandatory)][string]$ClientSpId,   # object id of the APP's service principal
+        [Parameter(Mandatory)][string]$DisplayName
+    )
+    $consentScope = 'openid profile email'
+    try {
+        # Microsoft Graph's well-known app id -> its service principal (the resource being consented to).
+        $graphResp = Invoke-MgGraphRequest -Method GET -OutputType PSObject `
+            -Uri "https://graph.microsoft.com/v1.0/servicePrincipals`?`$filter=appId eq '00000003-0000-0000-c000-000000000000'&`$select=id"
+        $graphSp = @($graphResp.value)[0]
+        if (-not $graphSp) { throw 'Microsoft Graph service principal not found in this tenant.' }
+
+        # Reuse an existing tenant-wide grant if present; otherwise create one.
+        $existingResp = Invoke-MgGraphRequest -Method GET -OutputType PSObject `
+            -Uri "https://graph.microsoft.com/v1.0/oauth2PermissionGrants`?`$filter=clientId eq '$ClientSpId' and consentType eq 'AllPrincipals' and resourceId eq '$($graphSp.id)'"
+        $existing = @($existingResp.value)[0]
+
+        if ($existing) {
+            $have   = @($existing.scope -split '\s+' | Where-Object { $_ })
+            $merged = (($have + ($consentScope -split '\s+')) | Select-Object -Unique) -join ' '
+            if ($merged -ne $existing.scope) {
+                Invoke-MgGraphRequest -Method PATCH `
+                    -Uri "https://graph.microsoft.com/v1.0/oauth2PermissionGrants/$($existing.id)" `
+                    -Body @{ scope = $merged } | Out-Null
+            }
+            Write-Host "Admin consent already present; scopes ensured: $merged." -ForegroundColor Green
+        } else {
+            Invoke-MgGraphRequest -Method POST `
+                -Uri 'https://graph.microsoft.com/v1.0/oauth2PermissionGrants' `
+                -Body @{ clientId = $ClientSpId; consentType = 'AllPrincipals'; resourceId = $graphSp.id; scope = $consentScope } | Out-Null
+            Write-Host "Granted tenant-wide admin consent for: $consentScope." -ForegroundColor Green
+        }
+        return $true
+    } catch {
+        Write-Warning "Could not grant admin consent: $($_.Exception.Message)"
+        Write-Warning "This needs a role such as Global Administrator, Privileged Role Administrator, Application Administrator, or Cloud Application Administrator, plus the DelegatedPermissionGrant.ReadWrite.All scope. You can still click 'Grant admin consent' in the portal (App registrations > $DisplayName > API permissions)."
+        return $false
+    }
+}
 
 # --- 1. Ensure the Graph Applications module is available -------------------------------
 if (-not (Get-Module -ListAvailable -Name Microsoft.Graph.Applications)) {
@@ -105,7 +166,8 @@ Import-Module Microsoft.Graph.Applications
 # RoleManagement.Read.Directory + User.Read let us verify the signed-in user's role before
 # attempting to create anything. Application.ReadWrite.All is needed to create the app.
 $scopes = @('Application.ReadWrite.All', 'RoleManagement.Read.Directory', 'User.Read')
-if ($AssignGroup) { $scopes += @('Group.Read.All', 'AppRoleAssignment.ReadWrite.All') }
+if ($AssignGroup)  { $scopes += @('Group.Read.All', 'AppRoleAssignment.ReadWrite.All') }
+if ($AdminConsent) { $scopes += 'DelegatedPermissionGrant.ReadWrite.All' }
 $connectArgs = @{ Scopes = $scopes }
 if ($TenantId)      { $connectArgs.TenantId = $TenantId }
 if ($UseDeviceCode) { $connectArgs.UseDeviceCode = $true }
@@ -198,7 +260,8 @@ $clientSecret = $secret.SecretText
 # whenever we manage assignment (the default) or a group was requested.
 $assignmentRequired = -not $NoAssignmentRequired
 $sp = $null
-if ($CreateServicePrincipal -or $assignmentRequired -or $AssignGroup) {
+$adminConsentGranted = $false
+if ($CreateServicePrincipal -or $assignmentRequired -or $AssignGroup -or $AdminConsent) {
     Write-Host "Creating service principal (enterprise application)..." -ForegroundColor Cyan
     $sp = New-MgServicePrincipal -AppId $clientId
 
@@ -229,6 +292,10 @@ if ($CreateServicePrincipal -or $assignmentRequired -or $AssignGroup) {
             Write-Warning "Group-based app assignment requires Entra ID P1 or higher. On the free tier, assign individual users in the portal (Enterprise applications > your app > Users and groups)."
         }
     }
+
+    if ($AdminConsent) {
+        $adminConsentGranted = Set-EntraAdminConsent -ClientSpId $sp.Id -DisplayName $DisplayName
+    }
 }
 
 # --- 6. Output -------------------------------------------------------------------------
@@ -244,6 +311,7 @@ Write-Host "Issuer               : $issuer"
 Write-Host "Discovery URL        : $issuer/.well-known/openid-configuration"
 Write-Host "Redirect URI(s)      : $($RedirectUri -join ', ')"
 if ($sp) { Write-Host "Assignment required  : $assignmentRequired$(if ($AssignGroup) { " (group: $AssignGroup)" })" }
+if ($AdminConsent) { Write-Host "Admin consent        : $(if ($adminConsentGranted) { 'granted tenant-wide (openid profile email)' } else { 'FAILED - grant manually in the portal' })" }
 Write-Host ""
 Write-Host "-------- Paste into your php-oidc config --------" -ForegroundColor Yellow
 @"
